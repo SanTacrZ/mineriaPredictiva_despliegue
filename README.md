@@ -37,6 +37,15 @@ predicciones_futuras.csv  # 5 casos futuros del informe
 figuras/                  # m1..m9 (correlaciones, árbol, confusión, ROC, accuracy, división)
 requirements.txt          # dependencias pineadas (mismas del env)
 .streamlit/config.toml    # tema profesional
+notebook_modelos.ipynb    # Jupyter notebook de modelos (entrenamiento + evaluación)
+notebook_despliegue.ipynb # Jupyter notebook de despliegue con interfaz gráfica (ipywidgets)
+```
+
+## 📓 Notebooks
+
+```bash
+./env/bin/pip install ipywidgets nbformat  # solo para la interfaz del notebook
+jupyter notebook notebook_despliegue.ipynb  # o ábrelo en VS Code / Colab
 ```
 
 ## 🧪 Variables del modelo
