@@ -6,3 +6,4 @@ numpy==2.5.3
 plotly==7.1.0
 protobuf==7.36.2
 pillow==12.3.0
+matplotlib==3.11.2
