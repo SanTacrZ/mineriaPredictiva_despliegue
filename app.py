@@ -1,7 +1,10 @@
-"""Predictor de Diabetes (Pima Indians) — modelo XGBoost.
+"""Predictor de Diabetes (Pima Indians) — modelo final hiperparametrizado.
+
 Ejecutar con el entorno del proyecto: ./env/bin/streamlit run app.py
+Carga `modelo_final.pkl` (generado en el notebook, sección C). Si no existe,
+usa `modelo_Xgboost.pkl`. Las métricas se leen de `resultados_medidas.csv`.
 """
-import json
+
 import warnings
 from pathlib import Path
 
@@ -13,6 +16,7 @@ import streamlit as st
 warnings.filterwarnings("ignore")
 
 BASE = Path(__file__).parent
+FIG = BASE / "figuras"
 FEATURES = ["Pregnancies", "Glucose", "BloodPressure", "BMI",
             "DiabetesPedigreeFunction", "Age"]
 LABELS_ES = {
@@ -23,7 +27,7 @@ LABELS_ES = {
     "DiabetesPedigreeFunction": "Antecedente familiar (DPF)",
     "Age": "Edad (años)",
 }
-# Rangos clínicos razonables para los controles + medianas de imputación del informe
+# (mínimo, máximo, valor por defecto, paso)
 RANGES = {
     "Pregnancies": (0, 17, 2, 1),
     "Glucose": (40, 250, 120, 1),
@@ -33,15 +37,11 @@ RANGES = {
     "Age": (18, 85, 32, 1),
 }
 MEDIANAS = {"Glucose": 117.0, "BloodPressure": 72.0, "BMI": 32.3}
-IMPORTANCIA_XGB = {  # del informe (xgboost, 50 árboles)
-    "Glucose": 0.296, "BMI": 0.185, "Age": 0.162,
-    "DiabetesPedigreeFunction": 0.128, "BloodPressure": 0.118,
-    "Pregnancies": 0.112,
-}
-UMBRAL = 0.5
+COLS_METRICAS = {"accuracy": "Accuracy", "precision": "Precisión", "recall": "Recall",
+                 "f1": "F1", "roc_auc": "ROC-AUC"}
 
 st.set_page_config(
-    page_title="Predictor de Diabetes | XGBoost",
+    page_title="Predictor de Diabetes",
     page_icon="🩺",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -71,61 +71,119 @@ footer { visibility:hidden; }
 st.markdown(CSS, unsafe_allow_html=True)
 
 
+# ---------------------------------------------------------------- carga
 @st.cache_resource
 def cargar_modelo():
     import pickle
-
-    with open(BASE / "modelo_Xgboost.pkl", "rb") as f:
-        return pickle.load(f)
+    for nombre in ("modelo_final.pkl", "modelo_Xgboost.pkl"):
+        ruta = BASE / nombre
+        if ruta.exists():
+            with open(ruta, "rb") as f:
+                return pickle.load(f), nombre
+    raise FileNotFoundError("No se encontró modelo_final.pkl ni modelo_Xgboost.pkl")
 
 
 @st.cache_data
 def cargar_metricas():
-    with open(BASE / "results.json", encoding="utf-8") as f:
-        res = json.load(f)
     tabla = pd.read_csv(BASE / "resultados_medidas.csv", index_col=0)
-    return res, tabla
+    tabla = tabla.rename(columns=COLS_METRICAS)  # por si vienen en minúscula
+    return tabla
 
 
-def predecir(df: pd.DataFrame):
-    modelo = cargar_modelo()
+@st.cache_data
+def matriz_confusion_test(nombre_modelo: str):
+    """Reproduce el split 70/30 estratificado (random_state=42) del notebook
+    sobre datos_limpios.csv y devuelve la matriz de confusión del modelo en test."""
+    try:
+        from sklearn.metrics import confusion_matrix
+        from sklearn.model_selection import train_test_split
+        df = pd.read_csv(BASE / "datos_limpios.csv")
+        X, y = df[FEATURES], df["Outcome"].astype(int)
+        _, X_te, _, y_te = train_test_split(X, y, test_size=0.30, stratify=y, random_state=42)
+        modelo, _ = cargar_modelo()
+        return confusion_matrix(y_te, modelo.predict(X_te)), len(X_te)
+    except Exception:
+        return None, 0
+
+
+def importancias(modelo):
+    """Importancia de variables si el último paso del pipeline la expone."""
+    try:
+        est = modelo.steps[-1][1] if hasattr(modelo, "steps") else modelo
+        imp = np.asarray(est.feature_importances_, dtype=float)
+        if len(imp) == len(FEATURES):
+            return dict(zip(FEATURES, imp))
+    except Exception:
+        pass
+    return None
+
+
+def descripcion_modelo(modelo):
+    if hasattr(modelo, "steps"):
+        pasos = " + ".join(type(p).__name__ for _, p in modelo.steps)
+        return pasos
+    return type(modelo).__name__
+
+
+def predecir(df: pd.DataFrame, umbral: float):
+    modelo, _ = cargar_modelo()
     proba = modelo.predict_proba(df[FEATURES])[:, 1]
-    pred = (proba >= UMBRAL).astype(int)
+    pred = (proba >= umbral).astype(int)
     return proba, pred
 
 
-def gauge(prob: float):
-    color = "#147A3E" if prob < UMBRAL else "#B42318"
+def gauge(prob: float, umbral: float):
+    color = "#147A3E" if prob < umbral else "#B42318"
     fig = go.Figure(go.Indicator(
         mode="gauge+number", value=float(prob * 100),
         number={"suffix": "%", "font": {"size": 44}},
         title={"text": "Probabilidad de diabetes", "font": {"size": 15}},
         gauge={"axis": {"range": [0, 100]},
                "bar": {"color": color},
-               "steps": [{"range": [0, 50], "color": "#E6F7ED"},
-                         {"range": [50, 100], "color": "#FDECEC"}],
+               "steps": [{"range": [0, umbral * 100], "color": "#E6F7ED"},
+                         {"range": [umbral * 100, 100], "color": "#FDECEC"}],
                "threshold": {"line": {"color": "#0B2545", "width": 3},
-                             "value": 50}}))
+                             "value": umbral * 100}}))
     fig.update_layout(height=280, margin=dict(l=20, r=20, t=50, b=10))
     return fig
 
 
-# ---------------- HERO ----------------
+def mostrar_img(nombre: str, titulo: str, caption: str = ""):
+    ruta = FIG / nombre
+    if ruta.exists():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.subheader(titulo)
+        st.image(str(ruta), width="stretch")
+        if caption:
+            st.caption(caption)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------- datos base
+modelo, archivo_modelo = cargar_modelo()
+tabla = cargar_metricas()
+fila_final = "Modelo final" if "Modelo final" in tabla.index else tabla["Accuracy"].idxmax()
+m = tabla.loc[fila_final]
+imp = importancias(modelo)
+desc_modelo = descripcion_modelo(modelo)
+
+# ---------------------------------------------------------------- HERO
 st.markdown(
-    """<div class="hero">
+    f"""<div class="hero">
     <h1>🩺 Predictor de Riesgo de Diabetes</h1>
     <p>Minería predictiva en Python · Dataset Pima Indians Diabetes (NIDDK) ·
-    Modelo final <b>XGBoost</b> (50 árboles · validación cruzada 10 pliegues · Accuracy test 0.769)</p>
-    <div class="chips"><span class="chip">🎯 Accuracy 0.769</span>
-    <span class="chip">📈 ROC-AUC 0.807</span><span class="chip">🔁 Recall 0.600</span>
+    Modelo final: <b>{desc_modelo}</b> · validación cruzada 10 pliegues + GridSearch</p>
+    <div class="chips"><span class="chip">🎯 Accuracy {m['Accuracy']:.3f}</span>
+    <span class="chip">📈 ROC-AUC {m['ROC-AUC']:.3f}</span>
+    <span class="chip">🔁 Recall {m['Recall']:.3f}</span>
     <span class="chip">🧪 6 variables clínicas</span></div></div>""",
     unsafe_allow_html=True,
 )
 
-# ---------------- SIDEBAR ----------------
+# ---------------------------------------------------------------- SIDEBAR
 with st.sidebar:
     st.header("📝 Datos del paciente")
-    st.caption("Ajusta las 6 variables clínicas y pulsa predecir.")
+    st.caption("Ajusta las 6 variables clínicas: el resultado se actualiza solo.")
     vals = {}
     for feat in FEATURES:
         lo, hi, dflt, step = RANGES[feat]
@@ -133,27 +191,28 @@ with st.sidebar:
                                value=dflt, step=step)
     st.divider()
     umbral = st.slider("Umbral de decisión", 0.1, 0.9, 0.5, 0.05)
-    st.caption(f"Umbral actual: **{umbral:.2f}** (por defecto 0.50)")
-    btn = st.button("🔍 Predecir riesgo", type="primary", use_container_width=True)
+    st.caption(f"Umbral actual: **{umbral:.2f}** (por defecto 0.50). "
+               "Bajarlo aumenta la detección de casos (recall) a costa de más falsos positivos.")
     st.divider()
-    st.caption("Pipeline: `MinMaxScaler` + `XGBClassifier(50 árboles)` · "
-               "Imputación por mediana: Glucosa 117 · Presión 72 · IMC 32.3")
+    st.caption(f"Pipeline: `{desc_modelo}` · archivo `{archivo_modelo}` · "
+               f"Imputación por mediana: Glucosa {MEDIANAS['Glucose']:.0f} · "
+               f"Presión {MEDIANAS['BloodPressure']:.0f} · IMC {MEDIANAS['BMI']}")
 
 tab_pred, tab_mod, tab_evid, tab_datos = st.tabs(
     ["🔮 Predicción", "📊 Modelos comparados", "🖼️ Evidencia", "📁 Datos y metodología"])
 
-# ---------------- TAB PREDICCIÓN ----------------
+# ---------------------------------------------------------------- TAB PREDICCIÓN
 with tab_pred:
     col1, col2 = st.columns([1.05, 1])
     entrada = pd.DataFrame([vals], columns=FEATURES)
-    proba, pred = predecir(entrada)
+    proba, pred = predecir(entrada, umbral)
     p = float(proba[0])
     positivo = p >= umbral
 
     with col1:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.subheader("Resultado")
-        st.plotly_chart(gauge(p), use_container_width=True)
+        st.plotly_chart(gauge(p, umbral), width="stretch")
         if positivo:
             st.markdown('<span class="badge-risk">⚠️ RIESGO ALTO — DIABETES</span>',
                         unsafe_allow_html=True)
@@ -164,7 +223,7 @@ with tab_pred:
                  f"**Clase:** `{'1 (diabetes)' if positivo else '0 (no diabetes)'}`")
         if p >= 0.75:
             st.warning("Probabilidad alta: se recomienda valoración médica prioritaria.")
-        elif p >= 0.5:
+        elif p >= umbral:
             st.info("Zona límite: repetir glucosa en ayunas y controlar IMC/presión.")
         else:
             st.success("Fuera de la zona de riesgo según el modelo. Mantener hábitos saludables.")
@@ -180,12 +239,14 @@ with tab_pred:
                 faltan = [c for c in FEATURES if c not in lote.columns]
                 if faltan:
                     st.error(f"Faltan columnas: {faltan}")
+                elif lote[FEATURES].isna().any().any():
+                    st.error("El archivo tiene valores vacíos en las variables del modelo.")
                 else:
-                    pb, pr = predecir(lote)
+                    pb, pr = predecir(lote, umbral)
                     out = lote[FEATURES].copy()
                     out["P(diabetes)"] = np.round(pb, 4)
                     out["Predicción"] = np.where(pr == 1, "DIABETES", "NO DIABETES")
-                    st.dataframe(out, use_container_width=True)
+                    st.dataframe(out, width="stretch")
                     st.download_button("⬇️ Descargar predicciones",
                                        out.to_csv(index=False).encode(),
                                        "predicciones_lote.csv", "text/csv")
@@ -197,12 +258,15 @@ with tab_pred:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.subheader("🧾 Variables ingresadas")
         det = pd.DataFrame({"Variable": [LABELS_ES[f] for f in FEATURES],
-                            "Valor": [vals[f] for f in FEATURES],
-                            "Importancia XGB": [IMPORTANCIA_XGB[f] for f in FEATURES]})
-        st.dataframe(det, use_container_width=True, hide_index=True)
-        st.bar_chart(det.set_index("Variable")["Importancia XGB"])
-        st.caption("Importancia del modelo ganador: la **Glucosa (0.296)** es la señal dominante, "
-                   "seguida del IMC y la Edad.")
+                            "Valor": [vals[f] for f in FEATURES]})
+        if imp:
+            det["Importancia del modelo"] = [round(imp[f], 3) for f in FEATURES]
+        st.dataframe(det, width="stretch", hide_index=True)
+        if imp:
+            st.bar_chart(det.set_index("Variable")["Importancia del modelo"])
+            top = sorted(imp, key=imp.get, reverse=True)[:3]
+            st.caption("Variables de mayor importancia en el modelo: "
+                       + ", ".join(f"**{LABELS_ES[t]}** ({imp[t]:.3f})" for t in top) + ".")
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -216,41 +280,38 @@ with tab_pred:
             msgs.append("🟡 Edad ≥45: aumenta la probabilidad basal.")
         if not msgs:
             msgs.append("🟢 Valores dentro de rangos moderados.")
-        for m in msgs:
-            st.write(m)
+        for t in msgs:
+            st.write(t)
         st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------- TAB MODELOS ----------------
+# ---------------------------------------------------------------- TAB MODELOS
 with tab_mod:
-    res, tabla = cargar_metricas()
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("🏆 Comparativa (test 30% · GridSearchCV 10 pliegues)")
     st.dataframe(tabla.style.format("{:.3f}").background_gradient(cmap="YlGn"),
-                 use_container_width=True)
-    mejor = tabla["Accuracy"].idxmax()
-    st.success(f"**Mejor modelo: {mejor}** — Accuracy {tabla.loc[mejor, 'Accuracy']:.3f} · "
-               f"F1 {tabla.loc[mejor, 'F1']:.3f} · Recall {tabla.loc[mejor, 'Recall']:.3f} · "
-               f"ROC-AUC {tabla.loc[mejor, 'ROC-AUC']:.3f}. "
-               "La SVM compite en AUC (0.829) pero detecta peor los casos positivos "
-               "(recall 0.475 vs 0.600).")
+                 width="stretch")
+    mejor_auc = tabla["ROC-AUC"].idxmax()
+    mejor_rec = tabla["Recall"].idxmax()
+    st.success(f"**Modelo desplegado: {fila_final}** — Accuracy {m['Accuracy']:.3f} · "
+               f"F1 {m['F1']:.3f} · Recall {m['Recall']:.3f} · ROC-AUC {m['ROC-AUC']:.3f}. "
+               f"Mayor AUC de la tabla: {mejor_auc} ({tabla.loc[mejor_auc, 'ROC-AUC']:.3f}); "
+               f"mayor recall: {mejor_rec} ({tabla.loc[mejor_rec, 'Recall']:.3f}).")
     st.bar_chart(tabla["Accuracy"])
     st.markdown("</div>", unsafe_allow_html=True)
 
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("Matrices de confusión")
-        st.image(str(BASE / "figuras" / "m6_confusion.png"), use_container_width=True)
-        st.caption("XGBoost: [[128, 21], [32, 48]] — mejor equilibrio en verdaderos positivos.")
-        st.markdown("</div>", unsafe_allow_html=True)
+        cm, n_te = matriz_confusion_test(archivo_modelo)
+        cap = ""
+        if cm is not None:
+            cap = (f"Modelo desplegado en el test ({n_te} registros): "
+                   f"[[{cm[0, 0]}, {cm[0, 1]}], [{cm[1, 0]}, {cm[1, 1]}]] "
+                   "(filas = real, columnas = predicho).")
+        mostrar_img("m6_confusion.png", "Matrices de confusión", cap)
     with c2:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("Curvas ROC")
-        st.image(str(BASE / "figuras" / "m7_roc.png"), use_container_width=True)
-        st.caption("SVM logra el AUC mayor; XGBoost el mejor compromiso accuracy/recall.")
-        st.markdown("</div>", unsafe_allow_html=True)
+        mostrar_img("m7_roc.png", "Curvas ROC")
 
-# ---------------- TAB EVIDENCIA ----------------
+# ---------------------------------------------------------------- TAB EVIDENCIA
 with tab_evid:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("🔎 Selección de factores y evidencias del notebook")
@@ -258,50 +319,53 @@ with tab_evid:
              "Embarazos 0.219 · DPF 0.172 · Presión 0.166. Ningún par supera |r|≥0.8 "
              "(máx. Embarazos–Edad ≈0.54): no hay redundancia grave. "
              "Se eliminaron `Insulin` (48.7% nulos) y `SkinThickness` (29.6% nulos); "
-             "se imputó por mediana y se pasó de 768 → **761 registros**.")
+             "se imputó por mediana y se pasó de 768 → **761 registros**. "
+             "Además se contrastó con información mutua, ANOVA e importancia por permutación.")
     st.markdown("</div>", unsafe_allow_html=True)
+
     for img, cap in [
         ("m1_correlaciones.png", "Matriz de correlaciones"),
         ("m2_correlacion_objetivo.png", "Correlación con la variable objetivo"),
-        ("m3_arbol.png", "Árbol de decisión (max_depth=3, var. dominante: Glucosa 0.713)"),
+        ("seleccion_factores.png", "Selección de factores (varios criterios)"),
+        ("m3_arbol.png", "Árbol de decisión"),
         ("m4_importancia_arbol.png", "Importancia de variables — Árbol / XGBoost"),
+        ("overfitting.png", "Revisión de overfitting: train vs CV vs test"),
         ("m8_accuracy.png", "Accuracy por método"),
         ("m9_division.png", "División estratificada 70/30 + CV 10 pliegues"),
     ]:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader(cap)
-        st.image(str(BASE / "figuras" / img), use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        mostrar_img(img, cap)
 
-# ---------------- TAB DATOS ----------------
+# ---------------------------------------------------------------- TAB DATOS
 with tab_datos:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("📁 Datos limpios (muestra)")
     st.dataframe(pd.read_csv(BASE / "datos_limpios.csv").head(10),
-                 use_container_width=True)
+                 width="stretch")
     st.caption("761 filas × 7 columnas · 0 nulos · clases 64.9% / 35.1%.")
     st.subheader("🔮 5 casos futuros del informe")
     st.dataframe(pd.read_csv(BASE / "predicciones_futuras.csv"),
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
     st.markdown("</div>", unsafe_allow_html=True)
+
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.subheader("⚙️ Metodología")
     st.markdown(
         "- **Objetivo:** clasificar riesgo de diabetes (Outcome 0/1).\n"
-        "- **Limpieza:** ceros imposibles → NaN; drop Insulin/SkinThickness; "
-        "imputación por mediana; 7 filas eliminadas.\n"
+        "- **Selección de factores:** correlación, información mutua, ANOVA e importancia "
+        "por permutación; se descartan Insulin y SkinThickness por exceso de nulos.\n"
+        "- **Limpieza:** ceros imposibles → NaN; imputación por mediana; 7 filas eliminadas.\n"
         "- **División:** 70/30 estratificada (532/229) + GridSearchCV con "
         "StratifiedKFold(10) sobre el train.\n"
         "- **Pipelines:** Tree/RF con discretización; KNN/SVM/MLP/XGB con MinMaxScaler "
         "(sin fuga de información).\n"
-        "- **Overfitting/underfitting:** se controla con CV de 10 pliegues y test reservado; "
-        "el árbol limitado a profundidad 3 y XGBoost con 50 árboles generalizan mejor "
-        "que la red MLP (0.655, subajuste) sin memorizar el train.\n"
-        "- **Hiperparámetros (GridSearch):** Tree max_depth=3 · MLP (32,8) · KNN k=5 · "
-        "SVM RBF C=0.1 · RF 150 árboles · **XGB 50 árboles**.\n"
-        "- **Despliegue:** este Streamlit carga `modelo_Xgboost.pkl` (scaler + clasificador).")
+        "- **Overfitting/underfitting:** se compara accuracy de entrenamiento, validación "
+        "cruzada y test por modelo (brecha train-CV > 0.08 ⇒ overfitting); ver la figura "
+        "`overfitting.png` en la pestaña Evidencia.\n"
+        "- **Hiperparámetros (GridSearch):** primera ronda por método y segunda ronda, más "
+        f"amplia, sobre el mejor modelo por CV. Modelo desplegado: `{desc_modelo}`.\n"
+        f"- **Despliegue:** esta app Streamlit carga `{archivo_modelo}` (pipeline completo).")
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown('<p class="small">Proyecto minería predictiva · Parcial 1 · '
-            "Modelo XGBoost serializado · Interfaz con fines académicos, no es diagnóstico médico.</p>",
+            "Interfaz con fines académicos, no es diagnóstico médico.</p>",
             unsafe_allow_html=True)
